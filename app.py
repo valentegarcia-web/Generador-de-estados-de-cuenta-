@@ -3,12 +3,12 @@ import pdfplumber
 import pandas as pd
 import io
 import re
-from copy import copy
 from collections import defaultdict
 from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
 
 # ============================================================
-# 1. CONFIGURACIÓN Y UTILIDADES (CON RADAR DE CELDAS COMBINADAS)
+# 1. CONFIGURACIÓN Y ESCUDOS CONTRA ERRORES
 # ============================================================
 st.set_page_config(page_title="Consolidador Financiero Confidelis", layout="wide")
 
@@ -25,25 +25,27 @@ def limpiar_numero(val):
     except ValueError:
         return 0.0
 
-# --- RADAR DE CELDAS COMBINADAS ---
-def obtener_celda_real(ws, row, col):
-    """Busca la celda 'maestra' si forma parte de un rango combinado."""
-    for rng in ws.merged_cells.ranges:
-        if rng.min_row <= row <= rng.max_row and rng.min_col <= col <= rng.max_col:
-            return ws.cell(rng.min_row, rng.min_col)
-    return ws.cell(row, col)
-
+# --- ESCUDO DEFINITIVO PARA CELDAS COMBINADAS ---
 def leer_celda_segura(ws, row, col):
-    """Lee el valor asegurándose de apuntar a la celda real."""
-    celda = obtener_celda_real(ws, row, col)
-    return limpiar_numero(celda.value)
+    celda = ws.cell(row, col)
+    if isinstance(celda, MergedCell):
+        for rng in ws.merged_cells.ranges:
+            if rng.min_col <= col <= rng.max_col and rng.min_row <= row <= rng.max_row:
+                return ws.cell(rng.min_row, rng.min_col).value
+    return celda.value
 
 def escribir_celda_segura(ws, row, col, valor):
-    """Escribe el valor en la celda real para evitar el error 'MergedCell read-only'."""
-    celda = obtener_celda_real(ws, row, col)
-    celda.value = valor
+    try:
+        ws.cell(row, col).value = valor
+    except AttributeError:
+        for rng in ws.merged_cells.ranges:
+            if rng.min_col <= col <= rng.max_col and rng.min_row <= row <= rng.max_row:
+                ws.cell(rng.min_row, rng.min_col).value = valor
+                break
 
-# --- EXTRACCIÓN DE TEXTO ---
+# ============================================================
+# 2. MOTOR DE EXTRACCIÓN (PDF -> DATOS)
+# ============================================================
 def extraer_numeros(texto):
     nums = re.findall(r"\d[\d,]*\.\d+", texto)
     return [float(n.replace(",", "")) for n in nums if n.replace(",", "")]
@@ -63,9 +65,6 @@ def extraer_periodo(texto):
     m = re.search(r"DE\s+([A-Z]+)\s+DE\s+(\d{4})", texto.upper())
     return f"{m.group(1)} {m.group(2)}" if m else "NUEVO"
 
-# ============================================================
-# 2. MOTOR DE EXTRACCIÓN FINANCIERA (PDF -> DATOS)
-# ============================================================
 def procesar_pdf_financiero(f):
     with pdfplumber.open(f) as pdf:
         texto_p1 = pdf.pages[0].extract_text() or ""
@@ -135,21 +134,17 @@ def procesar_pdf_financiero(f):
         return nombre, datos
 
 # ============================================================
-# 3. LÓGICA MAESTRA DE CONSOLIDACIÓN (EXCEL)
+# 3. LÓGICA MAESTRA DE CONSOLIDACIÓN (1 SOLO ARCHIVO)
 # ============================================================
 def actualizar_hoja_maestra(ws, info):
     fila_header = 23
     fila_totales = fila_efectivo_gbm = None
     
-    # Buscar filas clave utilizando la lectura segura
     for r in range(1, 150):
-        celda = obtener_celda_real(ws, r, 1)
-        val = normalizar(celda.value)
+        val = normalizar(leer_celda_segura(ws, r, 1))
         if "INSTRUMENTO" in val: fila_header = r
         if "EFECTIVO GBM" in val: fila_efectivo_gbm = r
-        if "TOTALES" in val: 
-            fila_totales = r
-            break
+        if "TOTALES" in val: fila_totales = r; break
     
     if not fila_totales: return
 
@@ -158,10 +153,8 @@ def actualizar_hoja_maestra(ws, info):
     # --------------------------------------------------------
     if info["plataforma"] == "Prestadero":
         for r in range(fila_header + 1, fila_totales):
-            celda_nombre = obtener_celda_real(ws, r, 1)
-            if "PRESTADERO" in normalizar(celda_nombre.value):
-                saldo_ini = leer_celda_segura(ws, r, 2)
-                
+            if "PRESTADERO" in normalizar(leer_celda_segura(ws, r, 1)):
+                saldo_ini = limpiar_numero(leer_celda_segura(ws, r, 2))
                 escribir_celda_segura(ws, r, 3, info["valor_total"])
                 escribir_celda_segura(ws, r, 5, info["valor_total"] - saldo_ini)
                 escribir_celda_segura(ws, r, 7, info["interes_mes"])
@@ -172,7 +165,7 @@ def actualizar_hoja_maestra(ws, info):
                 escribir_celda_segura(ws, r, 14, info["valor_total"])
 
     # --------------------------------------------------------
-    # CASO B: GBM (Fibras, Acciones, Efectivo)
+    # CASO B: GBM
     # --------------------------------------------------------
     elif info["plataforma"] == "GBM":
         port_pdf = info["portafolio"]
@@ -183,17 +176,15 @@ def actualizar_hoja_maestra(ws, info):
         total_compras_mes = sum(movs["COMPRAS"].values())
         total_ventas_mes = sum(movs["VENTAS"].values())
 
-        # 1. Actualizar Fibras Existentes
+        # 1. Actualizar Existentes (La magia de la memoria ocurre aquí)
         for r in range(fila_header + 1, fila_totales):
-            celda_nombre = obtener_celda_real(ws, r, 1)
-            nom = normalizar(celda_nombre.value)
-            
+            nom = normalizar(leer_celda_segura(ws, r, 1))
             if not nom or nom == "-" or "EFECTIVO GBM" in nom: continue
             
             instrumentos_vistos.add(nom)
             
-            old_b = leer_celda_segura(ws, r, 2)
-            old_c = leer_celda_segura(ws, r, 3)
+            old_b = limpiar_numero(leer_celda_segura(ws, r, 2))
+            old_c = limpiar_numero(leer_celda_segura(ws, r, 3)) # ¡Leemos el mes pasado antes de sobrescribir!
             
             compra = movs["COMPRAS"].get(nom, 0.0)
             venta = movs["VENTAS"].get(nom, 0.0)
@@ -206,6 +197,7 @@ def actualizar_hoja_maestra(ws, info):
             escribir_celda_segura(ws, r, 2, nuevo_b)
             escribir_celda_segura(ws, r, 3, nuevo_c)
             escribir_celda_segura(ws, r, 5, nuevo_c - nuevo_b)
+            # Ganancia del mes: Nuevo valor - Viejo valor + ventas - compras
             escribir_celda_segura(ws, r, 7, nuevo_c - old_c + venta - compra)
             escribir_celda_segura(ws, r, 10, venta)
             escribir_celda_segura(ws, r, 11, compra)
@@ -219,8 +211,6 @@ def actualizar_hoja_maestra(ws, info):
                 ws.insert_rows(pos)
                 compra_nueva = movs["COMPRAS"].get(emisora_pdf, item["valor_mercado"])
                 
-                # Las filas nuevas no están combinadas, así que escribir directo es seguro,
-                # pero usamos la función segura por consistencia.
                 escribir_celda_segura(ws, pos, 1, emisora_pdf)
                 escribir_celda_segura(ws, pos, 2, compra_nueva)
                 escribir_celda_segura(ws, pos, 3, item["valor_mercado"])
@@ -239,7 +229,7 @@ def actualizar_hoja_maestra(ws, info):
 
         # 3. Balancear EFECTIVO GBM
         if fila_efectivo_gbm:
-            old_efec_b = leer_celda_segura(ws, fila_efectivo_gbm, 2)
+            old_efec_b = limpiar_numero(leer_celda_segura(ws, fila_efectivo_gbm, 2))
             
             escribir_celda_segura(ws, fila_efectivo_gbm, 2, old_efec_b + total_ventas_mes - total_compras_mes)
             escribir_celda_segura(ws, fila_efectivo_gbm, 3, info["efectivo_total"])
@@ -255,29 +245,33 @@ def actualizar_hoja_maestra(ws, info):
     # ACTUALIZAR FORMULAS % CARTERA
     # --------------------------------------------------------
     for r in range(fila_header + 1, fila_totales):
-        celda_nombre = obtener_celda_real(ws, r, 1)
-        if celda_nombre.value and celda_nombre.value != "-":
+        celda_nombre = normalizar(leer_celda_segura(ws, r, 1))
+        if celda_nombre and celda_nombre != "-":
             escribir_celda_segura(ws, r, 12, f"=C{r}/C{fila_totales}")
 
 # ============================================================
-# 4. APLICACIÓN WEB STREAMLIT
+# 4. INTERFAZ STREAMLIT (SIMPLE Y POTENTE)
 # ============================================================
 def main():
-    st.title("🏦 Motor de Consolidación Financiera")
-    st.markdown("Automatización de saldos, reclasificación y partida doble.")
+    st.title("🏦 Consolidación Financiera a un Clic")
+    st.markdown("Carga el Maestro del mes pasado y los PDFs nuevos. El sistema calculará la partida doble automáticamente.")
     
     col1, col2 = st.columns(2)
-    with col1: maestro_file = st.file_uploader("1. Excel Maestro (Mes Anterior)", type="xlsx")
-    with col2: pdf_files = st.file_uploader("2. PDFs (Mes Actual)", type="pdf", accept_multiple_files=True)
+    with col1: 
+        maestro_file = st.file_uploader("1. Excel Maestro (Mes Anterior)", type="xlsx")
+    with col2: 
+        pdf_files = st.file_uploader("2. PDFs del Mes Actual", type="pdf", accept_multiple_files=True)
 
     if st.button("🚀 Iniciar Consolidación", use_container_width=True):
         if maestro_file and pdf_files:
             try:
                 wb = load_workbook(maestro_file)
-                with st.spinner("Sincronizando movimientos y balanceando carteras..."):
+                
+                with st.spinner("Sincronizando movimientos y calculando rendimientos..."):
                     for f in pdf_files:
                         nombre, datos = procesar_pdf_financiero(f)
                         sheet_name = next((s for s in wb.sheetnames if all(p in s.upper() for p in nombre.split()[:2])), None)
+                        
                         if sheet_name:
                             actualizar_hoja_maestra(wb[sheet_name], datos)
                             st.success(f"✅ Hoja consolidada: {sheet_name}")
@@ -290,7 +284,7 @@ def main():
                 st.download_button(
                     label="📥 Descargar Estado de Cuenta Consolidado",
                     data=buf,
-                    file_name="Estado_Cuenta_Actualizado.xlsx",
+                    file_name="Estado_Cuenta_Final_Actualizado.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
