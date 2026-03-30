@@ -8,7 +8,7 @@ from collections import defaultdict
 from openpyxl import load_workbook
 
 # ============================================================
-# 1. CONFIGURACIÓN Y UTILIDADES BÁSICAS (CON ESCUDO DE ERRORES)
+# 1. CONFIGURACIÓN Y UTILIDADES (CON RADAR DE CELDAS COMBINADAS)
 # ============================================================
 st.set_page_config(page_title="Consolidador Financiero Confidelis", layout="wide")
 
@@ -16,28 +16,39 @@ def normalizar(t):
     return str(t).upper().strip() if t else ""
 
 def limpiar_numero(val):
-    """Escudo: Convierte celdas vacías, guiones o textos a 0.0 de forma segura."""
-    if val is None: 
-        return 0.0
-    if isinstance(val, (int, float)): 
-        return float(val)
-    # Limpiamos espacios, comas y símbolos de dólar
+    if val is None: return 0.0
+    if isinstance(val, (int, float)): return float(val)
     s = str(val).replace(",", "").replace("$", "").strip()
-    # Si es un guion o está vacío, es un cero financiero
-    if s in ("", "-", "–", "NA", "N/A", "ND"): 
-        return 0.0
+    if s in ("", "-", "–", "NA", "N/A", "ND"): return 0.0
     try:
         return float(s)
     except ValueError:
         return 0.0
 
+# --- RADAR DE CELDAS COMBINADAS ---
+def obtener_celda_real(ws, row, col):
+    """Busca la celda 'maestra' si forma parte de un rango combinado."""
+    for rng in ws.merged_cells.ranges:
+        if rng.min_row <= row <= rng.max_row and rng.min_col <= col <= rng.max_col:
+            return ws.cell(rng.min_row, rng.min_col)
+    return ws.cell(row, col)
+
+def leer_celda_segura(ws, row, col):
+    """Lee el valor asegurándose de apuntar a la celda real."""
+    celda = obtener_celda_real(ws, row, col)
+    return limpiar_numero(celda.value)
+
+def escribir_celda_segura(ws, row, col, valor):
+    """Escribe el valor en la celda real para evitar el error 'MergedCell read-only'."""
+    celda = obtener_celda_real(ws, row, col)
+    celda.value = valor
+
+# --- EXTRACCIÓN DE TEXTO ---
 def extraer_numeros(texto):
-    """Extrae solo números que tengan decimales, evitando comas perdidas."""
     nums = re.findall(r"\d[\d,]*\.\d+", texto)
     return [float(n.replace(",", "")) for n in nums if n.replace(",", "")]
 
 def extraer_todos_numeros(texto):
-    """Extrae todos los números, enteros o decimales."""
     nums = re.findall(r"\d[\d,]*\.?\d*", texto)
     return [float(n.replace(",", "")) for n in nums if n.replace(",", "")]
 
@@ -130,8 +141,10 @@ def actualizar_hoja_maestra(ws, info):
     fila_header = 23
     fila_totales = fila_efectivo_gbm = None
     
+    # Buscar filas clave utilizando la lectura segura
     for r in range(1, 150):
-        val = normalizar(ws.cell(r, 1).value)
+        celda = obtener_celda_real(ws, r, 1)
+        val = normalizar(celda.value)
         if "INSTRUMENTO" in val: fila_header = r
         if "EFECTIVO GBM" in val: fila_efectivo_gbm = r
         if "TOTALES" in val: 
@@ -145,18 +158,18 @@ def actualizar_hoja_maestra(ws, info):
     # --------------------------------------------------------
     if info["plataforma"] == "Prestadero":
         for r in range(fila_header + 1, fila_totales):
-            if "PRESTADERO" in normalizar(ws.cell(r, 1).value):
-                # Aplicamos el escudo 'limpiar_numero'
-                saldo_ini = limpiar_numero(ws.cell(r, 2).value)
+            celda_nombre = obtener_celda_real(ws, r, 1)
+            if "PRESTADERO" in normalizar(celda_nombre.value):
+                saldo_ini = leer_celda_segura(ws, r, 2)
                 
-                ws.cell(r, 3).value = info["valor_total"]
-                ws.cell(r, 5).value = info["valor_total"] - saldo_ini
-                ws.cell(r, 7).value = info["interes_mes"]
-                ws.cell(r, 9).value = "ESPECULATIVO\nMODERADO" 
-                ws.cell(r, 10).value = info["retiros"]
-                ws.cell(r, 11).value = info["depositos"]
-                ws.cell(r, 13).value = "BAJA" 
-                ws.cell(r, 14).value = info["valor_total"]
+                escribir_celda_segura(ws, r, 3, info["valor_total"])
+                escribir_celda_segura(ws, r, 5, info["valor_total"] - saldo_ini)
+                escribir_celda_segura(ws, r, 7, info["interes_mes"])
+                escribir_celda_segura(ws, r, 9, "ESPECULATIVO\nMODERADO")
+                escribir_celda_segura(ws, r, 10, info["retiros"])
+                escribir_celda_segura(ws, r, 11, info["depositos"])
+                escribir_celda_segura(ws, r, 13, "BAJA")
+                escribir_celda_segura(ws, r, 14, info["valor_total"])
 
     # --------------------------------------------------------
     # CASO B: GBM (Fibras, Acciones, Efectivo)
@@ -172,14 +185,15 @@ def actualizar_hoja_maestra(ws, info):
 
         # 1. Actualizar Fibras Existentes
         for r in range(fila_header + 1, fila_totales):
-            nom = normalizar(ws.cell(r, 1).value)
+            celda_nombre = obtener_celda_real(ws, r, 1)
+            nom = normalizar(celda_nombre.value)
+            
             if not nom or nom == "-" or "EFECTIVO GBM" in nom: continue
             
             instrumentos_vistos.add(nom)
             
-            # Aplicamos el escudo 'limpiar_numero'
-            old_b = limpiar_numero(ws.cell(r, 2).value)
-            old_c = limpiar_numero(ws.cell(r, 3).value)
+            old_b = leer_celda_segura(ws, r, 2)
+            old_c = leer_celda_segura(ws, r, 3)
             
             compra = movs["COMPRAS"].get(nom, 0.0)
             venta = movs["VENTAS"].get(nom, 0.0)
@@ -188,13 +202,14 @@ def actualizar_hoja_maestra(ws, info):
             if nom not in emisoras_en_pdf and venta == 0 and compra == 0: continue
 
             nuevo_b = max(0.0, old_b + compra - venta)
-            ws.cell(r, 2).value = nuevo_b
-            ws.cell(r, 3).value = nuevo_c
-            ws.cell(r, 5).value = nuevo_c - nuevo_b
-            ws.cell(r, 7).value = nuevo_c - old_c + venta - compra
-            ws.cell(r, 10).value = venta  
-            ws.cell(r, 11).value = compra 
-            ws.cell(r, 14).value = nuevo_c
+            
+            escribir_celda_segura(ws, r, 2, nuevo_b)
+            escribir_celda_segura(ws, r, 3, nuevo_c)
+            escribir_celda_segura(ws, r, 5, nuevo_c - nuevo_b)
+            escribir_celda_segura(ws, r, 7, nuevo_c - old_c + venta - compra)
+            escribir_celda_segura(ws, r, 10, venta)
+            escribir_celda_segura(ws, r, 11, compra)
+            escribir_celda_segura(ws, r, 14, nuevo_c)
 
         # 2. Insertar Fibras Nuevas
         for item in port_pdf:
@@ -204,43 +219,45 @@ def actualizar_hoja_maestra(ws, info):
                 ws.insert_rows(pos)
                 compra_nueva = movs["COMPRAS"].get(emisora_pdf, item["valor_mercado"])
                 
-                ws.cell(pos, 1).value = emisora_pdf
-                ws.cell(pos, 2).value = compra_nueva
-                ws.cell(pos, 3).value = item["valor_mercado"]
-                ws.cell(pos, 4).value = info["periodo"]
-                ws.cell(pos, 5).value = item["valor_mercado"] - compra_nueva
-                ws.cell(pos, 7).value = item["valor_mercado"] - compra_nueva
-                ws.cell(pos, 9).value = "ESPECULATIVO\nCONSERVADOR" 
-                ws.cell(pos, 10).value = 0.0 
-                ws.cell(pos, 11).value = compra_nueva 
-                ws.cell(pos, 13).value = "ALTA" 
-                ws.cell(pos, 14).value = item["valor_mercado"]
-                ws.cell(pos, 15).value = "GBM"
+                # Las filas nuevas no están combinadas, así que escribir directo es seguro,
+                # pero usamos la función segura por consistencia.
+                escribir_celda_segura(ws, pos, 1, emisora_pdf)
+                escribir_celda_segura(ws, pos, 2, compra_nueva)
+                escribir_celda_segura(ws, pos, 3, item["valor_mercado"])
+                escribir_celda_segura(ws, pos, 4, info["periodo"])
+                escribir_celda_segura(ws, pos, 5, item["valor_mercado"] - compra_nueva)
+                escribir_celda_segura(ws, pos, 7, item["valor_mercado"] - compra_nueva)
+                escribir_celda_segura(ws, pos, 9, "ESPECULATIVO\nCONSERVADOR")
+                escribir_celda_segura(ws, pos, 10, 0.0)
+                escribir_celda_segura(ws, pos, 11, compra_nueva)
+                escribir_celda_segura(ws, pos, 13, "ALTA")
+                escribir_celda_segura(ws, pos, 14, item["valor_mercado"])
+                escribir_celda_segura(ws, pos, 15, "GBM")
                 
                 if fila_efectivo_gbm: fila_efectivo_gbm += 1
                 fila_totales += 1
 
         # 3. Balancear EFECTIVO GBM
         if fila_efectivo_gbm:
-            # Aplicamos el escudo al Efectivo GBM
-            old_efec_b = limpiar_numero(ws.cell(fila_efectivo_gbm, 2).value)
+            old_efec_b = leer_celda_segura(ws, fila_efectivo_gbm, 2)
             
-            ws.cell(fila_efectivo_gbm, 2).value = old_efec_b + total_ventas_mes - total_compras_mes
-            ws.cell(fila_efectivo_gbm, 3).value = info["efectivo_total"]
-            ws.cell(fila_efectivo_gbm, 5).value = "-"
-            ws.cell(fila_efectivo_gbm, 7).value = "-"
-            ws.cell(fila_efectivo_gbm, 9).value = "CONSERVADOR\nCONSERVADOR" 
-            ws.cell(fila_efectivo_gbm, 10).value = total_compras_mes 
-            ws.cell(fila_efectivo_gbm, 11).value = total_ventas_mes  
-            ws.cell(fila_efectivo_gbm, 13).value = "ALTA" 
-            ws.cell(fila_efectivo_gbm, 14).value = info["efectivo_total"]
+            escribir_celda_segura(ws, fila_efectivo_gbm, 2, old_efec_b + total_ventas_mes - total_compras_mes)
+            escribir_celda_segura(ws, fila_efectivo_gbm, 3, info["efectivo_total"])
+            escribir_celda_segura(ws, fila_efectivo_gbm, 5, "-")
+            escribir_celda_segura(ws, fila_efectivo_gbm, 7, "-")
+            escribir_celda_segura(ws, fila_efectivo_gbm, 9, "CONSERVADOR\nCONSERVADOR")
+            escribir_celda_segura(ws, fila_efectivo_gbm, 10, total_compras_mes)
+            escribir_celda_segura(ws, fila_efectivo_gbm, 11, total_ventas_mes)
+            escribir_celda_segura(ws, fila_efectivo_gbm, 13, "ALTA")
+            escribir_celda_segura(ws, fila_efectivo_gbm, 14, info["efectivo_total"])
 
     # --------------------------------------------------------
     # ACTUALIZAR FORMULAS % CARTERA
     # --------------------------------------------------------
     for r in range(fila_header + 1, fila_totales):
-        if ws.cell(r, 1).value and ws.cell(r, 1).value != "-":
-            ws.cell(r, 12).value = f"=C{r}/C{fila_totales}"
+        celda_nombre = obtener_celda_real(ws, r, 1)
+        if celda_nombre.value and celda_nombre.value != "-":
+            escribir_celda_segura(ws, r, 12, f"=C{r}/C{fila_totales}")
 
 # ============================================================
 # 4. APLICACIÓN WEB STREAMLIT
@@ -278,7 +295,11 @@ def main():
                     use_container_width=True
                 )
             except Exception as e:
+                import traceback
+                error_detallado = traceback.format_exc()
                 st.error(f"❌ Error crítico procesando los datos: {e}")
+                with st.expander("Ver detalles técnicos del error"):
+                    st.text(error_detallado)
         else:
             st.error("Por favor, sube el Excel y al menos un PDF.")
 
