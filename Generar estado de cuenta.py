@@ -70,7 +70,6 @@ if temp_saldo > 0:
             mes_liquidacion = "Nunca (El pago no cubre los intereses)"
             break
         
-        # Si el pago mensual alcanza para liquidar EXACTAMENTE o SOBRA
         if st.session_state.pago_mensual >= (temp_saldo + int_d):
             mes_liquidacion = m
             break
@@ -96,7 +95,6 @@ saldo_deuda_s = st.session_state.prestamo
 saldo_deuda_c = st.session_state.prestamo
 
 for m in range(1, st.session_state.plazo_meses + 1):
-    # Lógica de Deuda (Es igual para ambos)
     if saldo_deuda_s > 0:
         int_d = saldo_deuda_s * ((st.session_state.tasa_prestamo/100)/12)
         if st.session_state.pago_mensual >= (saldo_deuda_s + int_d):
@@ -112,12 +110,12 @@ for m in range(1, st.session_state.plazo_meses + 1):
 
     retiro_mes = sum(r['Monto'] for r in st.session_state.retiros if r['Mes'] == m)
     
-    # 1. ESCENARIO INTERÉS SIMPLE
+    # ESCENARIO INTERÉS SIMPLE
     rend_s = saldo_inv_s * (tasa_ponderada / 12)
     flujo_neto_s = rend_s - pago_real - retiro_mes
     bolsillo_s = flujo_neto_s if flujo_neto_s > 0 else 0.0
     if flujo_neto_s < 0:
-        saldo_inv_s += flujo_neto_s # Se come el capital si no alcanza
+        saldo_inv_s += flujo_neto_s 
         if saldo_inv_s < 0: saldo_inv_s = 0.0
         
     datos_simple.append({
@@ -126,15 +124,15 @@ for m in range(1, st.session_state.plazo_meses + 1):
         "Saldo Inversión": saldo_inv_s, "Deuda Restante": saldo_deuda_s
     })
 
-    # 2. ESCENARIO INTERÉS COMPUESTO
+    # ESCENARIO INTERÉS COMPUESTO
     rend_c = saldo_inv_c * (tasa_ponderada / 12)
     flujo_neto_c = rend_c - pago_real - retiro_mes
-    saldo_inv_c += flujo_neto_c # Se reinvierte todo
+    saldo_inv_c += flujo_neto_c 
     if saldo_inv_c < 0: saldo_inv_c = 0.0
         
     datos_compuesto.append({
         "Mes": int(m), "Rendimiento Generado": rend_c, "Pago Crédito": pago_real, 
-        "Retiro Programado": retiro_mes, "Flujo Libre (Bolsillo)": 0.0, # Nada al bolsillo
+        "Retiro Programado": retiro_mes, "Flujo Libre (Bolsillo)": 0.0, 
         "Saldo Inversión": saldo_inv_c, "Deuda Restante": saldo_deuda_c
     })
 
@@ -340,113 +338,4 @@ with t2:
         pct_prestamo = min(total_inyeccion / st.session_state.prestamo, 1.0) if st.session_state.prestamo > 0 else 0
         pct_falta = (falta_prestamo / st.session_state.prestamo) * 100 if st.session_state.prestamo > 0 else 0
         
-        modo_iny = st.radio("Distribuir préstamo por:", ["Monto ($)", "Porcentaje (%)"], horizontal=True)
-        texto_progreso = f"Falta por asignar: {pct_falta:.2f}% (${falta_prestamo:,.2f})" if modo_iny == "Porcentaje (%)" else f"Falta por asignar: ${falta_prestamo:,.2f}"
-        color_falta = "green" if falta_prestamo == 0 else "red"
-        st.markdown(f"<div class='progress-text'>Préstamo asignado: ${total_inyeccion:,.2f} | <span style='color:{color_falta};'>{texto_progreso}</span></div>", unsafe_allow_html=True)
-        st.progress(pct_prestamo)
-
-        for idx, inst in enumerate(st.session_state.instrumentos):
-            c_nom, c_in, c_res = st.columns([2, 2, 3])
-            c_nom.markdown(f"<br>👉 **{inst['Instrumento']}**<br>Saldo actual: ${inst['Monto (MXN)']:,.0f}", unsafe_allow_html=True)
-            actual_iny = inst.get('Inyección', 0.0)
-            max_monto = float(actual_iny + falta_prestamo)
-            
-            if modo_iny == "Monto ($)":
-                nueva_inyeccion = c_in.number_input("Inyectar ($) sin comas", min_value=0.0, max_value=max_monto, value=float(actual_iny), step=10000.0, key=f"iny_{idx}")
-                c_in.markdown(f"<span style='color:#666;'>${nueva_inyeccion:,.2f}</span>", unsafe_allow_html=True)
-            else:
-                pct_actual = (actual_iny / st.session_state.prestamo) * 100 if st.session_state.prestamo > 0 else 0.0
-                max_pct = (max_monto / st.session_state.prestamo) * 100 if st.session_state.prestamo > 0 else 0.0
-                nuevo_pct = c_in.number_input("Inyectar (%)", min_value=0.0, max_value=float(max_pct), value=float(pct_actual), step=1.0, format="%.2f", key=f"inypct_{idx}")
-                nueva_inyeccion = (nuevo_pct / 100) * st.session_state.prestamo
-                c_in.markdown(f"<span style='color:#666;'>${nueva_inyeccion:,.2f}</span>", unsafe_allow_html=True)
-            
-            if nueva_inyeccion != actual_iny:
-                st.session_state.instrumentos[idx]['Inyección'] = nueva_inyeccion
-                st.rerun()
-                
-            flujo_extra = (nueva_inyeccion * (inst['Tasa Anual %']/100)) / 12
-            c_res.info(f"**Nuevo Saldo:** ${(inst['Monto (MXN)'] + nueva_inyeccion):,.2f} | **Flujo Extra:** +${flujo_extra:,.2f}/mes")
-
-# ----------------- PESTAÑA 3: FLUJOS Y RETIROS -----------------
-with t3:
-    st.subheader("Configuración de Proyección")
-    st.session_state.plazo_meses = st.number_input("Meses a proyectar en la tabla", min_value=12, max_value=360, value=st.session_state.plazo_meses, step=12)
-
-    with st.expander("💸 Programar Retiros Especiales (Ej. Vacaciones, Colegiaturas)"):
-        st.write("Agrega retiros de capital en meses específicos.")
-        cr1, cr2, cr3 = st.columns([1, 2, 1])
-        mes_retiro = cr1.number_input("Mes del Retiro", min_value=1, max_value=int(st.session_state.plazo_meses), value=12, step=1)
-        monto_retiro = cr2.number_input("Monto a Retirar ($)", min_value=0.0, step=10000.0)
-        
-        if cr3.button("➕ Agregar Retiro"):
-            if monto_retiro > 0:
-                st.session_state.retiros.append({"Mes": int(mes_retiro), "Monto": float(monto_retiro)})
-                st.rerun()
-                
-        if st.session_state.retiros:
-            df_ret = pd.DataFrame(st.session_state.retiros).sort_values("Mes")
-            st.dataframe(df_ret.style.format({'Monto': '${:,.2f}'}), use_container_width=True)
-            if st.button("🗑️ Limpiar todos los retiros"):
-                st.session_state.retiros = []
-                st.rerun()
-
-    st.write("---")
-    st.markdown(f"<div class='resumen-card'><h4>💡 Resumen de la Estrategia:</h4><p>{texto_resumen}</p></div><br>", unsafe_allow_html=True)
-    
-    # === SUB-PESTAÑAS PARA VER AMBOS ESCENARIOS ===
-    tab_comp, tab_simp = st.tabs(["📈 Estrategia: Interés Compuesto", "📊 Estrategia: Interés Simple"])
-    
-    formato_flujo = {'Mes': '{:d}', 'Rendimiento Generado': '${:,.2f}', 'Pago Crédito': '${:,.2f}', 'Retiro Programado': '${:,.2f}', 'Flujo Libre (Bolsillo)': '${:,.2f}', 'Saldo Inversión': '${:,.2f}', 'Deuda Restante': '${:,.2f}'}
-    
-    with tab_comp:
-        st.info("**Interés Compuesto:** Todo el dinero sobrante después de pagar deuda/retiros se reinvierte automáticamente en el capital.")
-        st.dataframe(df_compuesto.style.format(formato_flujo), use_container_width=True)
-        
-    with tab_simp:
-        st.info("**Interés Simple:** El dinero sobrante después de pagar deuda/retiros se retira al bolsillo. El capital base no crece.")
-        st.dataframe(df_simple.style.format(formato_flujo), use_container_width=True)
-
-# ----------------- PESTAÑA 4: RESUMEN GENERAL -----------------
-with t4:
-    st.subheader("📊 Dashboard Directivo")
-    if df_prop.empty:
-        st.warning("Agrega instrumentos para ver el resumen.")
-    else:
-        total_inyeccion = sum(inst.get('Inyección', 0.0) for inst in st.session_state.instrumentos)
-        
-        m1, m2, m3 = st.columns(3)
-        m1.markdown(f"<div class='metric-box'>Capital Base<br><h2>${st.session_state.monto_base:,.0f}</h2></div>", unsafe_allow_html=True)
-        m2.markdown(f"<div class='metric-box'>Préstamo Inyectado<br><h2>${total_inyeccion:,.0f}</h2></div>", unsafe_allow_html=True)
-        m3.markdown(f"<div class='metric-box'>Portafolio Activo<br><h2>${(st.session_state.monto_base + total_inyeccion):,.0f}</h2></div>", unsafe_allow_html=True)
-        
-        st.write("")
-        m4, m5, m6 = st.columns(3)
-        m4.markdown(f"<div class='metric-box'>Tasa Ponderada Anual<br><h2>{tasa_ponderada*100:.2f}%</h2></div>", unsafe_allow_html=True)
-...         
-...         saldo_final_comp = df_compuesto['Saldo Inversión'].iloc[-1] if not df_compuesto.empty else 0
-...         c_saldo = "#006400" if saldo_final_comp > capital_inicial else "#002147"
-...         m5.markdown(f"<div class='metric-box'>Saldo Final (Compuesto)<br><h2 style='color:{c_saldo};'>${saldo_final_comp:,.0f}</h2></div>", unsafe_allow_html=True)
-...         
-...         saldo_final_simp = df_simple['Saldo Inversión'].iloc[-1] if not df_simple.empty else 0
-...         m6.markdown(f"<div class='metric-box'>Saldo Final (Simple)<br><h2>${saldo_final_simp:,.0f}</h2></div>", unsafe_allow_html=True)
-... 
-... # ----------------- PESTAÑA 5: EXPORTACIÓN -----------------
-... with t5:
-...     st.subheader("📥 Exportar Documentos")
-...     opciones_descarga = ["Resumen Ejecutivo", "Portafolio Actual", "Portafolio Propuesto", "Flujos (Interés Simple)", "Flujos (Interés Compuesto)"]
-...     
-...     # Ahora puedes seleccionar qué tabla de flujos exportar
-...     seleccion = st.multiselect("Selecciona los módulos a incluir en tu descarga:", opciones_descarga, default=opciones_descarga)
-...     
-...     st.divider()
-...     c_btn1, c_btn2 = st.columns(2)
-...     if len(seleccion) > 0 and not df_actual.empty:
-...         with c_btn1:
-...             pdf_data = generar_pdf_custom(cliente, seleccion, df_actual, df_prop, df_simple, df_compuesto, texto_resumen)
-...             st.download_button("📄 PDF Oficial", pdf_data, f"Confidelis_{cliente}.pdf", "application/pdf")
-...         with c_btn2:
-...             excel_data = generar_excel_custom(seleccion, df_actual, df_prop, df_simple, df_compuesto)
-...             st.download_button("📊 Excel de Datos", excel_data, f"Confidelis_{cliente}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-...     else:
+        modo_iny
