@@ -8,16 +8,9 @@ from collections import defaultdict
 from openpyxl import load_workbook
 
 # ============================================================
-# 1. CONFIGURACIÓN Y UTILIDADES FINANCIERAS
+# 1. CONFIGURACIÓN DE PÁGINA Y UTILIDADES
 # ============================================================
-st.set_page_config(page_title="Consolidador Confidelis", layout="wide")
-
-MESES = {
-    "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
-    "MAYO": 5, "JUNIO": 6, "JULIO": 7, "AGOSTO": 8,
-    "SEPTIEMBRE": 9, "OCTUBRE": 10, "NOVIEMBRE": 11, "DICIEMBRE": 12,
-}
-MESES_INV = {v: k for k, v in MESES.items()}
+st.set_page_config(page_title="Consolidador Confidelis PRO", layout="wide")
 
 def normalizar(t):
     return str(t).upper().strip() if t else ""
@@ -29,7 +22,7 @@ def extraer_todos_numeros(texto):
     return [float(n.replace(",", "")) for n in re.findall(r"[\d,]+\.?\d*", texto) if n]
 
 # ============================================================
-# 2. MOTOR DE EXTRACCIÓN (Basado en extractor_gbm.py)
+# 2. MOTOR DE EXTRACCIÓN (PDF -> Datos)
 # ============================================================
 def detectar_plataforma(texto):
     return "Prestadero" if "PRESTADERO" in texto.upper() else "GBM"
@@ -68,13 +61,13 @@ def extraer_portafolio_gbm(pdf):
     return portafolio
 
 # ============================================================
-# 3. LÓGICA DE CONSOLIDACIÓN (Sumas, Restas e Inserción)
+# 3. LÓGICA DE CONSOLIDACIÓN (Actualización de Celdas)
 # ============================================================
 def actualizar_hoja_maestra(ws, datos_pdf):
-    # Localizar filas clave
     fila_header = 23
     fila_totales = None
-    for r in range(1, 100):
+    # Buscar dinámicamente la fila de Totales
+    for r in range(1, 150):
         val = str(ws.cell(r, 1).value).upper()
         if "INSTRUMENTO" in val: fila_header = r
         if "TOTALES" in val: 
@@ -82,48 +75,50 @@ def actualizar_hoja_maestra(ws, datos_pdf):
             break
     
     if not fila_totales: return
-    
-    # 1. Mapear lo que ya existe en el Excel
+
+    # Mapear instrumentos existentes en el Excel
     existentes = {}
     for r in range(fila_header + 1, fila_totales):
         nom = normalizar(ws.cell(r, 1).value)
         if nom and nom != "-": existentes[nom] = r
 
-    # 2. Actualizar o Identificar nuevos
+    # Actualizar saldos o insertar nuevos
     port_pdf = {normalizar(i["emisora"]): i["valor"] for i in datos_pdf.get("portafolio", [])}
     
     for emisora, valor_nuevo in port_pdf.items():
         if emisora in existentes:
             row = existentes[emisora]
             old_b = ws.cell(row, 2).value or 0
-            ws.cell(row, 3).value = valor_nuevo  # C: Saldo Actual
-            ws.cell(row, 5).value = valor_nuevo - old_b # E: Ganancia
-            ws.cell(row, 14).value = valor_nuevo # N: Total
+            ws.cell(row, 3).value = valor_nuevo
+            ws.cell(row, 5).value = valor_nuevo - old_b
+            ws.cell(row, 14).value = valor_nuevo
         else:
-            # LÓGICA DE INSTRUMENTO NUEVO: Insertar antes de TOTALES
+            # Insertar nueva fila antes de Totales
             ws.insert_rows(fila_totales)
             ws.cell(fila_totales, 1).value = emisora
-            ws.cell(fila_totales, 2).value = valor_nuevo # B: Inversión inicial
-            ws.cell(fila_totales, 3).value = valor_nuevo # C: Saldo
+            ws.cell(fila_totales, 2).value = valor_nuevo
+            ws.cell(fila_totales, 3).value = valor_nuevo
             ws.cell(fila_totales, 14).value = valor_nuevo
             ws.cell(fila_totales, 15).value = "GBM"
-            fila_totales += 1 # Desplazar el marcador de totales
+            fila_totales += 1
 
 # ============================================================
-# 4. INTERFAZ STREAMLIT
+# 4. APLICACIÓN STREAMLIT
 # ============================================================
 def main():
-    st.title("💰 Consolidador Financiero Unificado")
-    st.markdown("Carga tus archivos para procesar la rentabilidad del mes.")
+    st.title("💰 Consolidador Confidelis - Versión Cloud")
+    st.info("Sube el archivo maestro y los PDFs para consolidar la información.")
 
-    with st.sidebar:
-        st.header("Entrada de Archivos")
-        maestro_file = st.file_uploader("Excel Maestro (.xlsx)", type="xlsx")
-        pdf_files = st.file_uploader("PDFs GBM/Prestadero", type="pdf", accept_multiple_files=True)
+    # Selectores de Archivos
+    maestro_file = st.file_uploader("1. Sube el Maestro (.xlsx)", type="xlsx")
+    pdf_files = st.file_uploader("2. Sube los PDFs", type="pdf", accept_multiple_files=True)
 
-    if st.button("🚀 Iniciar Proceso"):
+    if st.button("🚀 Iniciar Consolidación"):
         if maestro_file and pdf_files:
             try:
+                # Cargar Maestro en memoria
+                wb = load_workbook(maestro_file)
+                
                 # Procesar PDFs
                 clientes_dict = defaultdict(lambda: {"portafolio": []})
                 for f in pdf_files:
@@ -133,28 +128,31 @@ def main():
                         if plat == "GBM":
                             clientes_dict[nombre]["portafolio"].extend(extraer_portafolio_gbm(pdf))
 
-                # Procesar Excel
-                wb = load_workbook(maestro_file)
+                # Actualizar hojas del Excel
                 for nombre, data in clientes_dict.items():
-                    # Buscar hoja por nombre de cliente
                     sheet_name = next((s for s in wb.sheetnames if nombre in s.upper() or s.upper() in nombre), None)
                     if sheet_name:
                         actualizar_hoja_maestra(wb[sheet_name], data)
-                        st.success(f"✅ Hoja '{sheet_name}' actualizada.")
+                        st.success(f"Hoja '{sheet_name}' actualizada correctamente.")
+                    else:
+                        st.warning(f"No se encontró hoja para: {nombre}")
+
+                # --- MANEJO SEGURO DEL BUFFER DE DESCARGA ---
+                buffer = io.BytesIO()
+                wb.save(buffer)
+                buffer.seek(0) # Mover puntero al inicio del archivo
                 
-                # Descarga
-                out = io.BytesIO()
-                wb.save(out)
                 st.download_button(
-                    label="📥 Descargar Reporte Consolidado",
-                    data=out.getvalue(),
+                    label="📥 Descargar Excel Consolidado",
+                    data=buffer,
                     file_name="Consolidado_Final.xlsx",
-                    mime="application/octet-stream"
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+                
             except Exception as e:
-                st.error(f"Error técnico: {str(e)}")
+                st.error(f"Error durante el procesamiento: {e}")
         else:
-            st.warning("Por favor carga el Maestro y los PDFs.")
+            st.warning("Asegúrate de cargar todos los archivos necesarios.")
 
 if __name__ == "__main__":
     main()
