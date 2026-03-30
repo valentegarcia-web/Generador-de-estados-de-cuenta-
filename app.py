@@ -3,15 +3,14 @@ import pdfplumber
 import pandas as pd
 import io
 import re
-import os
 from copy import copy
 from collections import defaultdict
 from openpyxl import load_workbook
 
 # ============================================================
-# CONFIGURACIÓN Y CONSTANTES
+# 1. CONFIGURACIÓN Y UTILIDADES FINANCIERAS
 # ============================================================
-st.set_page_config(page_title="Consolidador Financiero PRO", layout="wide")
+st.set_page_config(page_title="Consolidador Confidelis", layout="wide")
 
 MESES = {
     "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
@@ -20,17 +19,18 @@ MESES = {
 }
 MESES_INV = {v: k for k, v in MESES.items()}
 
-# ============================================================
-# MOTOR DE EXTRACCIÓN (Lógica de tus archivos originales)
-# ============================================================
+def normalizar(t):
+    return str(t).upper().strip() if t else ""
+
 def extraer_numeros(texto):
-    nums = re.findall(r"[\d,]+\.\d+", texto)
-    return [float(n.replace(",", "")) for n in nums]
+    return [float(n.replace(",", "")) for n in re.findall(r"[\d,]+\.\d+", texto)]
 
 def extraer_todos_numeros(texto):
-    nums = re.findall(r"[\d,]+\.?\d*", texto)
-    return [float(n.replace(",", "")) for n in nums if n]
+    return [float(n.replace(",", "")) for n in re.findall(r"[\d,]+\.?\d*", texto) if n]
 
+# ============================================================
+# 2. MOTOR DE EXTRACCIÓN (Basado en extractor_gbm.py)
+# ============================================================
 def detectar_plataforma(texto):
     return "Prestadero" if "PRESTADERO" in texto.upper() else "GBM"
 
@@ -48,122 +48,113 @@ def extraer_nombre_cliente(pdf, plataforma):
                 return p.replace("PUBLICO EN GENERAL - ", "").upper()
     return "DESCONOCIDO"
 
-def es_smart_cash(texto):
-    for l in texto.split("\n"):
-        if "RENTA VARIABLE" in l and "VALORES EN CORTO" not in l:
-            nums = extraer_numeros(l)
-            if len(nums) >= 2 and nums[1] > 0: return False
-    return True
-
-# --- Funciones de Portafolio y Movimientos ---
 def extraer_portafolio_gbm(pdf):
     portafolio = []
-    en_desglose = en_acciones = False
+    en_acciones = False
     for pag in pdf.pages:
         texto = pag.extract_text() or ""
         for l in texto.split("\n"):
-            ls, lu = l.strip(), l.strip().upper()
-            if "DESGLOSE DEL PORTAFOLIO" in lu: en_desglose = True; continue
-            if not en_desglose: continue
-            if lu == "ACCIONES": en_acciones = True; continue
-            if en_acciones and lu.startswith("TOTAL"): en_acciones = False; continue
+            lu = l.upper()
+            if "ACCIONES" in lu: en_acciones = True; continue
+            if en_acciones and (lu.startswith("TOTAL") or "RENDIMIENTO" in lu): 
+                en_acciones = False; continue
             if not en_acciones: continue
             
-            m = re.match(r"^([A-Z]+(?:\s+\d+)?)\s+", ls)
+            m = re.match(r"^([A-Z]+(?:\s+\d+)?)\s+", l.strip())
             if m:
-                nums = extraer_todos_numeros(ls[m.end():])
+                nums = extraer_todos_numeros(l[m.end():])
                 if len(nums) >= 8:
-                    portafolio.append({
-                        "Emisora": m.group(1).strip(),
-                        "Valor a Mercado": nums[7]
-                    })
+                    portafolio.append({"emisora": m.group(1).strip(), "valor": nums[7]})
     return portafolio
 
 # ============================================================
-# MOTOR DE CONSOLIDACIÓN (Lógica de Actualización de Excel)
+# 3. LÓGICA DE CONSOLIDACIÓN (Sumas, Restas e Inserción)
 # ============================================================
-def actualizar_hoja(ws, datos):
-    # Localizar fila de encabezado y totales
-    fila_header = 23 # Valor por defecto según tu consolidador.py
+def actualizar_hoja_maestra(ws, datos_pdf):
+    # Localizar filas clave
+    fila_header = 23
     fila_totales = None
-    for r in range(fila_header, fila_header + 50):
-        if ws.cell(r, 1).value and "TOTALES" in str(ws.cell(r, 1).value).upper():
+    for r in range(1, 100):
+        val = str(ws.cell(r, 1).value).upper()
+        if "INSTRUMENTO" in val: fila_header = r
+        if "TOTALES" in val: 
             fila_totales = r
             break
     
-    if not fila_totales: return False
+    if not fila_totales: return
+    
+    # 1. Mapear lo que ya existe en el Excel
+    existentes = {}
+    for r in range(fila_header + 1, fila_totales):
+        nom = normalizar(ws.cell(r, 1).value)
+        if nom and nom != "-": existentes[nom] = r
 
-    # Actualizar instrumentos existentes
-    gbm = datos.get("gbm")
-    if gbm:
-        port_pdf = {item["Emisora"]: item["Valor a Mercado"] for item in gbm.get("portafolio", [])}
-        
-        for r in range(fila_header + 1, fila_totales):
-            nombre_instrumento = ws.cell(r, 1).value
-            if nombre_instrumento in port_pdf:
-                nuevo_valor = port_pdf[nombre_instrumento]
-                old_b = ws.cell(r, 2).value or 0
+    # 2. Actualizar o Identificar nuevos
+    port_pdf = {normalizar(i["emisora"]): i["valor"] for i in datos_pdf.get("portafolio", [])}
+    
+    for emisora, valor_nuevo in port_pdf.items():
+        if emisora in existentes:
+            row = existentes[emisora]
+            old_b = ws.cell(row, 2).value or 0
+            ws.cell(row, 3).value = valor_nuevo  # C: Saldo Actual
+            ws.cell(row, 5).value = valor_nuevo - old_b # E: Ganancia
+            ws.cell(row, 14).value = valor_nuevo # N: Total
+        else:
+            # LÓGICA DE INSTRUMENTO NUEVO: Insertar antes de TOTALES
+            ws.insert_rows(fila_totales)
+            ws.cell(fila_totales, 1).value = emisora
+            ws.cell(fila_totales, 2).value = valor_nuevo # B: Inversión inicial
+            ws.cell(fila_totales, 3).value = valor_nuevo # C: Saldo
+            ws.cell(fila_totales, 14).value = valor_nuevo
+            ws.cell(fila_totales, 15).value = "GBM"
+            fila_totales += 1 # Desplazar el marcador de totales
+
+# ============================================================
+# 4. INTERFAZ STREAMLIT
+# ============================================================
+def main():
+    st.title("💰 Consolidador Financiero Unificado")
+    st.markdown("Carga tus archivos para procesar la rentabilidad del mes.")
+
+    with st.sidebar:
+        st.header("Entrada de Archivos")
+        maestro_file = st.file_uploader("Excel Maestro (.xlsx)", type="xlsx")
+        pdf_files = st.file_uploader("PDFs GBM/Prestadero", type="pdf", accept_multiple_files=True)
+
+    if st.button("🚀 Iniciar Proceso"):
+        if maestro_file and pdf_files:
+            try:
+                # Procesar PDFs
+                clientes_dict = defaultdict(lambda: {"portafolio": []})
+                for f in pdf_files:
+                    with pdfplumber.open(f) as pdf:
+                        plat = detectar_plataforma(pdf.pages[0].extract_text() or "")
+                        nombre = extraer_nombre_cliente(pdf, plat)
+                        if plat == "GBM":
+                            clientes_dict[nombre]["portafolio"].extend(extraer_portafolio_gbm(pdf))
+
+                # Procesar Excel
+                wb = load_workbook(maestro_file)
+                for nombre, data in clientes_dict.items():
+                    # Buscar hoja por nombre de cliente
+                    sheet_name = next((s for s in wb.sheetnames if nombre in s.upper() or s.upper() in nombre), None)
+                    if sheet_name:
+                        actualizar_hoja_maestra(wb[sheet_name], data)
+                        st.success(f"✅ Hoja '{sheet_name}' actualizada.")
                 
-                # C = Saldo Total
-                ws.cell(r, 3).value = nuevo_valor
-                # E = Ganancia Histórica (C - B)
-                ws.cell(r, 5).value = nuevo_valor - old_b
-                # N = Total
-                ws.cell(r, 14).value = nuevo_valor
-    return True
+                # Descarga
+                out = io.BytesIO()
+                wb.save(out)
+                st.download_button(
+                    label="📥 Descargar Reporte Consolidado",
+                    data=out.getvalue(),
+                    file_name="Consolidado_Final.xlsx",
+                    mime="application/octet-stream"
+                )
+            except Exception as e:
+                st.error(f"Error técnico: {str(e)}")
+        else:
+            st.warning("Por favor carga el Maestro y los PDFs.")
 
-# ============================================================
-# INTERFAZ STREAMLIT
-# ============================================================
-st.title("🚀 Consolidador Financiero Automatizado")
-st.markdown("Sistema experto para procesar estados de cuenta GBM y Prestadero.")
-
-with st.sidebar:
-    st.header("Carga de Datos")
-    maestro_file = st.file_uploader("Subir Maestro Anterior (.xlsx)", type="xlsx")
-    pdf_files = st.file_uploader("Subir PDFs del Mes", type="pdf", accept_multiple_files=True)
-
-if st.button("Ejecutar Consolidación"):
-    if not maestro_file or not pdf_files:
-        st.error("Debes subir el archivo maestro y al menos un PDF.")
-    else:
-        try:
-            # 1. Extraer datos de PDFs en memoria
-            clientes_data = defaultdict(lambda: {"gbm": None, "prestadero": None})
-            
-            for pdf_f in pdf_files:
-                with pdfplumber.open(pdf_f) as pdf:
-                    texto_p1 = pdf.pages[0].extract_text() or ""
-                    plat = detectar_plataforma(texto_p1)
-                    nombre = extraer_nombre_cliente(pdf, plat)
-                    
-                    if plat == "GBM":
-                        smart = es_smart_cash(texto_p1)
-                        port = extraer_portafolio_gbm(pdf)
-                        clientes_data[nombre]["gbm"] = {"portafolio": port, "smart": smart}
-                    # (Aquí agregarías la lógica de Prestadero similar a la de GBM)
-
-            # 2. Procesar el Excel
-            wb = load_workbook(maestro_file)
-            for nombre, datos in clientes_data.items():
-                # Buscar hoja (coincidencia simple)
-                hoja_nombre = next((s for s in wb.sheetnames if nombre in s.upper()), None)
-                if hoja_nombre:
-                    ws = wb[hoja_nombre]
-                    actualizar_hoja(ws, datos)
-                    st.success(f"Actualizada hoja: {hoja_nombre}")
-                else:
-                    st.warning(f"No se encontró hoja para el cliente: {nombre}")
-
-            # 3. Descarga del resultado
-            output = io.BytesIO()
-            wb.save(output)
-            st.download_button(
-                label="📥 Descargar Resultado Consolidado",
-                data=output.getvalue(),
-                file_name="Estado_Cuenta_Consolidado.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-        except Exception as e:
-            st.error(f"Error crítico: {e}")
+if __name__ == "__main__":
+    main()
