@@ -1,4 +1,5 @@
-pandas\
-plotly\
-fpdf\
-xlsxwriter}
+streamlit
+pandas
+plotly
+fpdf
+xlsxwriter
