@@ -3,6 +3,7 @@ import pdfplumber
 import pandas as pd
 import io
 import re
+from copy import copy
 from collections import defaultdict
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
@@ -42,6 +43,21 @@ def escribir_celda_segura(ws, row, col, valor):
             if rng.min_col <= col <= rng.max_col and rng.min_row <= row <= rng.max_row:
                 ws.cell(rng.min_row, rng.min_col).value = valor
                 break
+
+def clonar_formato(ws, fila_origen, fila_destino):
+    """Clona bordes, fuentes y fondos para que el Excel no pierda el estilo."""
+    for col in range(1, 16): # Columnas A hasta O
+        try:
+            celda_origen = ws.cell(fila_origen, col)
+            celda_destino = ws.cell(fila_destino, col)
+            if celda_origen.has_style:
+                celda_destino.font = copy(celda_origen.font)
+                celda_destino.border = copy(celda_origen.border)
+                celda_destino.fill = copy(celda_origen.fill)
+                celda_destino.number_format = celda_origen.number_format
+                celda_destino.alignment = copy(celda_origen.alignment)
+        except AttributeError:
+            pass # Ignora errores de estilo en celdas combinadas secundarias
 
 # ============================================================
 # 2. MOTOR DE EXTRACCIÓN (PDF -> DATOS)
@@ -176,7 +192,24 @@ def actualizar_hoja_maestra(ws, info):
         total_compras_mes = sum(movs["COMPRAS"].values())
         total_ventas_mes = sum(movs["VENTAS"].values())
 
-        # 1. Actualizar Existentes (La magia de la memoria ocurre aquí)
+        # 1. ELIMINAR FIBRAS ZOMBIES (De abajo hacia arriba)
+        for r in range(fila_totales - 1, fila_header, -1):
+            nom = normalizar(leer_celda_segura(ws, r, 1))
+            if not nom or nom == "-" or "EFECTIVO GBM" in nom: continue
+            
+            old_b = limpiar_numero(leer_celda_segura(ws, r, 2))
+            compra = movs["COMPRAS"].get(nom, 0.0)
+            venta = movs["VENTAS"].get(nom, 0.0)
+            nuevo_c = emisoras_en_pdf.get(nom, 0.0)
+            
+            # Si ya está en ceros y no hubo actividad, eliminamos la fila
+            if nuevo_c == 0.0 and compra == 0.0 and venta == 0.0 and old_b == 0.0:
+                ws.delete_rows(r)
+                fila_totales -= 1
+                if fila_efectivo_gbm and r < fila_efectivo_gbm:
+                    fila_efectivo_gbm -= 1
+
+        # 2. ACTUALIZAR FIBRAS VIVAS
         for r in range(fila_header + 1, fila_totales):
             nom = normalizar(leer_celda_segura(ws, r, 1))
             if not nom or nom == "-" or "EFECTIVO GBM" in nom: continue
@@ -184,12 +217,13 @@ def actualizar_hoja_maestra(ws, info):
             instrumentos_vistos.add(nom)
             
             old_b = limpiar_numero(leer_celda_segura(ws, r, 2))
-            old_c = limpiar_numero(leer_celda_segura(ws, r, 3)) # ¡Leemos el mes pasado antes de sobrescribir!
+            old_c = limpiar_numero(leer_celda_segura(ws, r, 3)) # Memoria del mes pasado
             
             compra = movs["COMPRAS"].get(nom, 0.0)
             venta = movs["VENTAS"].get(nom, 0.0)
             nuevo_c = emisoras_en_pdf.get(nom, 0.0)
 
+            # Si el instrumento no está en el PDF y no hay movimientos manuales, saltamos
             if nom not in emisoras_en_pdf and venta == 0 and compra == 0: continue
 
             nuevo_b = max(0.0, old_b + compra - venta)
@@ -197,18 +231,21 @@ def actualizar_hoja_maestra(ws, info):
             escribir_celda_segura(ws, r, 2, nuevo_b)
             escribir_celda_segura(ws, r, 3, nuevo_c)
             escribir_celda_segura(ws, r, 5, nuevo_c - nuevo_b)
-            # Ganancia del mes: Nuevo valor - Viejo valor + ventas - compras
             escribir_celda_segura(ws, r, 7, nuevo_c - old_c + venta - compra)
             escribir_celda_segura(ws, r, 10, venta)
             escribir_celda_segura(ws, r, 11, compra)
             escribir_celda_segura(ws, r, 14, nuevo_c)
 
-        # 2. Insertar Fibras Nuevas
+        # 3. INSERTAR FIBRAS NUEVAS (Con Formato)
         for item in port_pdf:
             emisora_pdf = normalizar(item["emisora"])
             if emisora_pdf not in instrumentos_vistos:
                 pos = fila_efectivo_gbm if fila_efectivo_gbm else fila_totales
                 ws.insert_rows(pos)
+                
+                # Clonar el estilo de la fila anterior para que tenga los bordes
+                clonar_formato(ws, pos - 1, pos)
+                
                 compra_nueva = movs["COMPRAS"].get(emisora_pdf, item["valor_mercado"])
                 
                 escribir_celda_segura(ws, pos, 1, emisora_pdf)
@@ -227,11 +264,12 @@ def actualizar_hoja_maestra(ws, info):
                 if fila_efectivo_gbm: fila_efectivo_gbm += 1
                 fila_totales += 1
 
-        # 3. Balancear EFECTIVO GBM
+        # 4. BALANCEAR EFECTIVO GBM
         if fila_efectivo_gbm:
             old_efec_b = limpiar_numero(leer_celda_segura(ws, fila_efectivo_gbm, 2))
+            nuevo_efec_b = old_efec_b + total_ventas_mes - total_compras_mes
             
-            escribir_celda_segura(ws, fila_efectivo_gbm, 2, old_efec_b + total_ventas_mes - total_compras_mes)
+            escribir_celda_segura(ws, fila_efectivo_gbm, 2, nuevo_efec_b)
             escribir_celda_segura(ws, fila_efectivo_gbm, 3, info["efectivo_total"])
             escribir_celda_segura(ws, fila_efectivo_gbm, 5, "-")
             escribir_celda_segura(ws, fila_efectivo_gbm, 7, "-")
@@ -241,13 +279,18 @@ def actualizar_hoja_maestra(ws, info):
             escribir_celda_segura(ws, fila_efectivo_gbm, 13, "ALTA")
             escribir_celda_segura(ws, fila_efectivo_gbm, 14, info["efectivo_total"])
 
-    # --------------------------------------------------------
-    # ACTUALIZAR FORMULAS % CARTERA
-    # --------------------------------------------------------
-    for r in range(fila_header + 1, fila_totales):
-        celda_nombre = normalizar(leer_celda_segura(ws, r, 1))
-        if celda_nombre and celda_nombre != "-":
-            escribir_celda_segura(ws, r, 12, f"=C{r}/C{fila_totales}")
+        # 5. RECALCULAR FÓRMULAS DE % CARTERA Y TOTALES
+        for r in range(fila_header + 1, fila_totales):
+            celda_nombre = normalizar(leer_celda_segura(ws, r, 1))
+            if celda_nombre and celda_nombre != "-":
+                escribir_celda_segura(ws, r, 12, f"=C{r}/C{fila_totales}")
+        
+        # Inyectar fórmula nativa de Excel para los Totales
+        rango_suma = f"{fila_header + 1}:{fila_totales - 1}"
+        escribir_celda_segura(ws, fila_totales, 2, f"=SUM(B{rango_suma})")
+        escribir_celda_segura(ws, fila_totales, 3, f"=SUM(C{rango_suma})")
+        escribir_celda_segura(ws, fila_totales, 5, f"=SUM(E{rango_suma})")
+        escribir_celda_segura(ws, fila_totales, 7, f"=SUM(G{rango_suma})")
 
 # ============================================================
 # 4. INTERFAZ STREAMLIT (SIMPLE Y POTENTE)
