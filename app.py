@@ -11,7 +11,7 @@ from openpyxl.cell.cell import MergedCell
 # ============================================================
 # 1. CONFIGURACIÓN Y ESCUDOS CONTRA ERRORES
 # ============================================================
-st.set_page_config(page_title="Consolidador Financiero Confidelis", layout="wide")
+st.set_page_config(page_title="Consolidador Confidelis Avanzado", layout="wide")
 
 def normalizar(t):
     return str(t).upper().strip() if t else ""
@@ -26,38 +26,51 @@ def limpiar_numero(val):
     except ValueError:
         return 0.0
 
-# --- ESCUDO DEFINITIVO PARA CELDAS COMBINADAS ---
+# --- ESCUDO DEFINITIVO CONTRA EL BUG DE CELDAS COMBINADAS ---
 def leer_celda_segura(ws, row, col):
+    """Lee el valor evadiendo el error de celda combinada."""
     celda = ws.cell(row, col)
-    if isinstance(celda, MergedCell):
+    if type(celda).__name__ == 'MergedCell':
         for rng in ws.merged_cells.ranges:
             if rng.min_col <= col <= rng.max_col and rng.min_row <= row <= rng.max_row:
                 return ws.cell(rng.min_row, rng.min_col).value
     return celda.value
 
 def escribir_celda_segura(ws, row, col, valor):
-    try:
-        ws.cell(row, col).value = valor
-    except AttributeError:
-        for rng in ws.merged_cells.ranges:
+    """Escribe forzosamente: Descombina, Escribe y Recombina para vencer a openpyxl."""
+    celda = ws.cell(row, col)
+    if type(celda).__name__ == 'MergedCell':
+        # Truco Ninja: Convertimos a lista para iterar sin afectar el diccionario en tiempo real
+        for rng in list(ws.merged_cells.ranges):
             if rng.min_col <= col <= rng.max_col and rng.min_row <= row <= rng.max_row:
-                ws.cell(rng.min_row, rng.min_col).value = valor
-                break
+                rango_str = str(rng)
+                try:
+                    # 1. Rompemos la combinación
+                    ws.unmerge_cells(rango_str)
+                    # 2. Escribimos en la celda pura
+                    ws.cell(rng.min_row, rng.min_col).value = valor
+                    # 3. Volvemos a combinar inmediatamente
+                    ws.merge_cells(rango_str)
+                except Exception:
+                    pass # En caso de que la inserción de filas haya roto el rango
+                return
+    else:
+        celda.value = valor
 
 def clonar_formato(ws, fila_origen, fila_destino):
-    """Clona bordes, fuentes y fondos para que el Excel no pierda el estilo."""
-    for col in range(1, 16): # Columnas A hasta O
+    """Clona el ADN de la fila (bordes, fuentes) para que no queden filas en blanco."""
+    for col in range(1, 16): 
         try:
-            celda_origen = ws.cell(fila_origen, col)
-            celda_destino = ws.cell(fila_destino, col)
-            if celda_origen.has_style:
-                celda_destino.font = copy(celda_origen.font)
-                celda_destino.border = copy(celda_origen.border)
-                celda_destino.fill = copy(celda_origen.fill)
-                celda_destino.number_format = celda_origen.number_format
-                celda_destino.alignment = copy(celda_origen.alignment)
+            c_origen = ws.cell(fila_origen, col)
+            c_destino = ws.cell(fila_destino, col)
+            if c_origen.has_style:
+                c_destino.font = copy(c_origen.font)
+                c_destino.border = copy(c_origen.border)
+                c_destino.fill = copy(c_origen.fill)
+                c_destino.number_format = c_origen.number_format
+                c_destino.alignment = copy(c_origen.alignment)
         except AttributeError:
-            pass # Ignora errores de estilo en celdas combinadas secundarias
+            pass
 
 # ============================================================
 # 2. MOTOR DE EXTRACCIÓN (PDF -> DATOS)
@@ -150,9 +163,29 @@ def procesar_pdf_financiero(f):
         return nombre, datos
 
 # ============================================================
-# 3. LÓGICA MAESTRA DE CONSOLIDACIÓN (1 SOLO ARCHIVO)
+# 3. EXTRACCIÓN DE SALDOS VIEJOS (DICIEMBRE)
 # ============================================================
-def actualizar_hoja_maestra(ws, info):
+def mapear_saldos_antiguos(wb_antiguo):
+    saldos = defaultdict(dict)
+    for sheet_name in wb_antiguo.sheetnames:
+        ws = wb_antiguo[sheet_name]
+        fila_header = 23
+        fila_totales = 150
+        for r in range(1, 150):
+            val = normalizar(leer_celda_segura(ws, r, 1))
+            if "INSTRUMENTO" in val: fila_header = r
+            if "TOTALES" in val: fila_totales = r; break
+        
+        for r in range(fila_header + 1, fila_totales):
+            inst = normalizar(leer_celda_segura(ws, r, 1))
+            if inst and inst != "-":
+                saldos[sheet_name][inst] = limpiar_numero(leer_celda_segura(ws, r, 3))
+    return saldos
+
+# ============================================================
+# 4. LÓGICA DE ESCRITURA EN MAESTRO BASE (ENERO)
+# ============================================================
+def actualizar_hoja_maestra(ws, info, saldos_antiguos_cliente):
     fila_header = 23
     fila_totales = fila_efectivo_gbm = None
     
@@ -192,7 +225,7 @@ def actualizar_hoja_maestra(ws, info):
         total_compras_mes = sum(movs["COMPRAS"].values())
         total_ventas_mes = sum(movs["VENTAS"].values())
 
-        # 1. ELIMINAR FIBRAS ZOMBIES (De abajo hacia arriba)
+        # 1. ELIMINAR FIBRAS ZOMBIES
         for r in range(fila_totales - 1, fila_header, -1):
             nom = normalizar(leer_celda_segura(ws, r, 1))
             if not nom or nom == "-" or "EFECTIVO GBM" in nom: continue
@@ -202,14 +235,13 @@ def actualizar_hoja_maestra(ws, info):
             venta = movs["VENTAS"].get(nom, 0.0)
             nuevo_c = emisoras_en_pdf.get(nom, 0.0)
             
-            # Si ya está en ceros y no hubo actividad, eliminamos la fila
             if nuevo_c == 0.0 and compra == 0.0 and venta == 0.0 and old_b == 0.0:
                 ws.delete_rows(r)
                 fila_totales -= 1
                 if fila_efectivo_gbm and r < fila_efectivo_gbm:
                     fila_efectivo_gbm -= 1
 
-        # 2. ACTUALIZAR FIBRAS VIVAS
+        # 2. ACTUALIZAR EXISTENTES
         for r in range(fila_header + 1, fila_totales):
             nom = normalizar(leer_celda_segura(ws, r, 1))
             if not nom or nom == "-" or "EFECTIVO GBM" in nom: continue
@@ -217,13 +249,12 @@ def actualizar_hoja_maestra(ws, info):
             instrumentos_vistos.add(nom)
             
             old_b = limpiar_numero(leer_celda_segura(ws, r, 2))
-            old_c = limpiar_numero(leer_celda_segura(ws, r, 3)) # Memoria del mes pasado
+            old_c = saldos_antiguos_cliente.get(nom, 0.0) # Uso del Excel Diciembre
             
             compra = movs["COMPRAS"].get(nom, 0.0)
             venta = movs["VENTAS"].get(nom, 0.0)
             nuevo_c = emisoras_en_pdf.get(nom, 0.0)
 
-            # Si el instrumento no está en el PDF y no hay movimientos manuales, saltamos
             if nom not in emisoras_en_pdf and venta == 0 and compra == 0: continue
 
             nuevo_b = max(0.0, old_b + compra - venta)
@@ -236,14 +267,13 @@ def actualizar_hoja_maestra(ws, info):
             escribir_celda_segura(ws, r, 11, compra)
             escribir_celda_segura(ws, r, 14, nuevo_c)
 
-        # 3. INSERTAR FIBRAS NUEVAS (Con Formato)
+        # 3. INSERTAR FIBRAS NUEVAS
         for item in port_pdf:
             emisora_pdf = normalizar(item["emisora"])
             if emisora_pdf not in instrumentos_vistos:
                 pos = fila_efectivo_gbm if fila_efectivo_gbm else fila_totales
                 ws.insert_rows(pos)
                 
-                # Clonar el estilo de la fila anterior para que tenga los bordes
                 clonar_formato(ws, pos - 1, pos)
                 
                 compra_nueva = movs["COMPRAS"].get(emisora_pdf, item["valor_mercado"])
@@ -267,9 +297,8 @@ def actualizar_hoja_maestra(ws, info):
         # 4. BALANCEAR EFECTIVO GBM
         if fila_efectivo_gbm:
             old_efec_b = limpiar_numero(leer_celda_segura(ws, fila_efectivo_gbm, 2))
-            nuevo_efec_b = old_efec_b + total_ventas_mes - total_compras_mes
             
-            escribir_celda_segura(ws, fila_efectivo_gbm, 2, nuevo_efec_b)
+            escribir_celda_segura(ws, fila_efectivo_gbm, 2, old_efec_b + total_ventas_mes - total_compras_mes)
             escribir_celda_segura(ws, fila_efectivo_gbm, 3, info["efectivo_total"])
             escribir_celda_segura(ws, fila_efectivo_gbm, 5, "-")
             escribir_celda_segura(ws, fila_efectivo_gbm, 7, "-")
@@ -279,13 +308,12 @@ def actualizar_hoja_maestra(ws, info):
             escribir_celda_segura(ws, fila_efectivo_gbm, 13, "ALTA")
             escribir_celda_segura(ws, fila_efectivo_gbm, 14, info["efectivo_total"])
 
-        # 5. RECALCULAR FÓRMULAS DE % CARTERA Y TOTALES
+        # 5. ACTUALIZAR FÓRMULAS
         for r in range(fila_header + 1, fila_totales):
             celda_nombre = normalizar(leer_celda_segura(ws, r, 1))
             if celda_nombre and celda_nombre != "-":
                 escribir_celda_segura(ws, r, 12, f"=C{r}/C{fila_totales}")
         
-        # Inyectar fórmula nativa de Excel para los Totales
         rango_suma = f"{fila_header + 1}:{fila_totales - 1}"
         escribir_celda_segura(ws, fila_totales, 2, f"=SUM(B{rango_suma})")
         escribir_celda_segura(ws, fila_totales, 3, f"=SUM(C{rango_suma})")
@@ -293,41 +321,48 @@ def actualizar_hoja_maestra(ws, info):
         escribir_celda_segura(ws, fila_totales, 7, f"=SUM(G{rango_suma})")
 
 # ============================================================
-# 4. INTERFAZ STREAMLIT (SIMPLE Y POTENTE)
+# 5. INTERFAZ STREAMLIT CON DOS MAESTROS
 # ============================================================
 def main():
-    st.title("🏦 Consolidación Financiera a un Clic")
-    st.markdown("Carga el Maestro del mes pasado y los PDFs nuevos. El sistema calculará la partida doble automáticamente.")
+    st.title("🏦 Consolidación Financiera a Dos Meses")
+    st.markdown("Compara el maestro antiguo contra el nuevo para obtener los rendimientos reales.")
     
     col1, col2 = st.columns(2)
     with col1: 
-        maestro_file = st.file_uploader("1. Excel Maestro (Mes Anterior)", type="xlsx")
+        maestro_antiguo = st.file_uploader("1. Excel Diciembre (Para extraer saldos antiguos)", type="xlsx")
+        maestro_base = st.file_uploader("2. Excel Enero (Donde se escribirá la información)", type="xlsx")
     with col2: 
-        pdf_files = st.file_uploader("2. PDFs del Mes Actual", type="pdf", accept_multiple_files=True)
+        pdf_files = st.file_uploader("3. PDFs del Mes Actual", type="pdf", accept_multiple_files=True)
 
     if st.button("🚀 Iniciar Consolidación", use_container_width=True):
-        if maestro_file and pdf_files:
+        if maestro_antiguo and maestro_base and pdf_files:
             try:
-                wb = load_workbook(maestro_file)
+                # 1. Extraer los saldos del mes anterior
+                wb_antiguo = load_workbook(maestro_antiguo)
+                saldos_mes_anterior = mapear_saldos_antiguos(wb_antiguo)
+
+                # 2. Cargar el Maestro Base y Procesar
+                wb_base = load_workbook(maestro_base)
                 
-                with st.spinner("Sincronizando movimientos y calculando rendimientos..."):
+                with st.spinner("Sincronizando movimientos y balanceando carteras..."):
                     for f in pdf_files:
                         nombre, datos = procesar_pdf_financiero(f)
-                        sheet_name = next((s for s in wb.sheetnames if all(p in s.upper() for p in nombre.split()[:2])), None)
+                        sheet_name = next((s for s in wb_base.sheetnames if all(p in s.upper() for p in nombre.split()[:2])), None)
                         
                         if sheet_name:
-                            actualizar_hoja_maestra(wb[sheet_name], datos)
+                            saldos_cliente_antiguo = saldos_mes_anterior.get(sheet_name, {})
+                            actualizar_hoja_maestra(wb_base[sheet_name], datos, saldos_cliente_antiguo)
                             st.success(f"✅ Hoja consolidada: {sheet_name}")
                         else:
-                            st.warning(f"⚠️ Cliente no encontrado en el Maestro: {nombre}")
+                            st.warning(f"⚠️ Cliente no encontrado en el Maestro Base: {nombre}")
 
                 buf = io.BytesIO()
-                wb.save(buf)
+                wb_base.save(buf)
                 buf.seek(0)
                 st.download_button(
                     label="📥 Descargar Estado de Cuenta Consolidado",
                     data=buf,
-                    file_name="Estado_Cuenta_Final_Actualizado.xlsx",
+                    file_name="Estado_Cuenta_Final.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
@@ -338,7 +373,7 @@ def main():
                 with st.expander("Ver detalles técnicos del error"):
                     st.text(error_detallado)
         else:
-            st.error("Por favor, sube el Excel y al menos un PDF.")
+            st.error("Por favor, sube los DOS Excel Maestros y al menos un PDF.")
 
 if __name__ == "__main__":
     main()
