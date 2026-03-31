@@ -26,9 +26,8 @@ def limpiar_numero(val):
     except ValueError:
         return 0.0
 
-# --- ESCUDO DEFINITIVO CONTRA EL BUG DE CELDAS COMBINADAS ---
+# --- ESCUDO CONTRA EL BUG DE CELDAS COMBINADAS ---
 def leer_celda_segura(ws, row, col):
-    """Lee el valor evadiendo el error de celda combinada."""
     celda = ws.cell(row, col)
     if type(celda).__name__ == 'MergedCell':
         for rng in ws.merged_cells.ranges:
@@ -37,7 +36,6 @@ def leer_celda_segura(ws, row, col):
     return celda.value
 
 def escribir_celda_segura(ws, row, col, valor):
-    """Escribe forzosamente: Descombina, Escribe y Recombina para vencer a openpyxl."""
     celda = ws.cell(row, col)
     if type(celda).__name__ == 'MergedCell':
         for rng in list(ws.merged_cells.ranges):
@@ -54,7 +52,6 @@ def escribir_celda_segura(ws, row, col, valor):
         celda.value = valor
 
 def clonar_formato(ws, fila_origen, fila_destino):
-    """Clona el ADN de la fila (bordes, fuentes) para que no queden filas en blanco."""
     for col in range(1, 16): 
         try:
             c_origen = ws.cell(fila_origen, col)
@@ -159,7 +156,7 @@ def procesar_pdf_financiero(f):
         return nombre, datos
 
 # ============================================================
-# 3. LÓGICA MAESTRA DE CONSOLIDACIÓN (1 SOLO ARCHIVO)
+# 3. LÓGICA MAESTRA DE CONSOLIDACIÓN
 # ============================================================
 def actualizar_hoja_maestra(ws, info):
     fila_header = 23
@@ -201,7 +198,7 @@ def actualizar_hoja_maestra(ws, info):
         total_compras_mes = sum(movs["COMPRAS"].values())
         total_ventas_mes = sum(movs["VENTAS"].values())
 
-        # 1. ELIMINAR FIBRAS ZOMBIES (De abajo hacia arriba para no dañar los índices)
+        # 1. ELIMINAR FIBRAS ZOMBIES
         for r in range(fila_totales - 1, fila_header, -1):
             nom = normalizar(leer_celda_segura(ws, r, 1))
             if not nom or nom == "-" or "EFECTIVO GBM" in nom: continue
@@ -225,7 +222,7 @@ def actualizar_hoja_maestra(ws, info):
             instrumentos_vistos.add(nom)
             
             old_b = limpiar_numero(leer_celda_segura(ws, r, 2))
-            old_c = limpiar_numero(leer_celda_segura(ws, r, 3)) # Memoria del mes anterior
+            old_c = limpiar_numero(leer_celda_segura(ws, r, 3))
             
             compra = movs["COMPRAS"].get(nom, 0.0)
             venta = movs["VENTAS"].get(nom, 0.0)
@@ -238,18 +235,17 @@ def actualizar_hoja_maestra(ws, info):
             escribir_celda_segura(ws, r, 2, nuevo_b)
             escribir_celda_segura(ws, r, 3, nuevo_c)
             escribir_celda_segura(ws, r, 5, nuevo_c - nuevo_b)
-            escribir_celda_segura(ws, r, 7, nuevo_c - old_c + venta - compra) # Cálculo Real del Mes
+            escribir_celda_segura(ws, r, 7, nuevo_c - old_c + venta - compra)
             escribir_celda_segura(ws, r, 10, venta)
             escribir_celda_segura(ws, r, 11, compra)
             escribir_celda_segura(ws, r, 14, nuevo_c)
 
-        # 3. INSERTAR FIBRAS NUEVAS (Con Formato)
+        # 3. INSERTAR FIBRAS NUEVAS
         for item in port_pdf:
             emisora_pdf = normalizar(item["emisora"])
             if emisora_pdf not in instrumentos_vistos:
                 pos = fila_efectivo_gbm if fila_efectivo_gbm else fila_totales
                 ws.insert_rows(pos)
-                
                 clonar_formato(ws, pos - 1, pos)
                 
                 compra_nueva = movs["COMPRAS"].get(emisora_pdf, item["valor_mercado"])
@@ -284,17 +280,28 @@ def actualizar_hoja_maestra(ws, info):
             escribir_celda_segura(ws, fila_efectivo_gbm, 13, "ALTA")
             escribir_celda_segura(ws, fila_efectivo_gbm, 14, info["efectivo_total"])
 
-        # 5. ACTUALIZAR FÓRMULAS
-        for r in range(fila_header + 1, fila_totales):
+        # 5. ACTUALIZAR FÓRMULAS DE TOTALES (CORRECCIÓN DE SINTAXIS)
+        inicio = fila_header + 1
+        fin = fila_totales - 1
+
+        for r in range(inicio, fila_totales):
             celda_nombre = normalizar(leer_celda_segura(ws, r, 1))
             if celda_nombre and celda_nombre != "-":
                 escribir_celda_segura(ws, r, 12, f"=C{r}/C{fila_totales}")
         
-        rango_suma = f"{fila_header + 1}:{fila_totales - 1}"
-        escribir_celda_segura(ws, fila_totales, 2, f"=SUM(B{rango_suma})")
-        escribir_celda_segura(ws, fila_totales, 3, f"=SUM(C{rango_suma})")
-        escribir_celda_segura(ws, fila_totales, 5, f"=SUM(E{rango_suma})")
-        escribir_celda_segura(ws, fila_totales, 7, f"=SUM(G{rango_suma})")
+        # Fórmulas de sumas estrictamente por columna (ej. =SUM(B24:B50))
+        escribir_celda_segura(ws, fila_totales, 2, f"=SUM(B{inicio}:B{fin})")
+        escribir_celda_segura(ws, fila_totales, 3, f"=SUM(C{inicio}:C{fin})")
+        escribir_celda_segura(ws, fila_totales, 5, f"=SUM(E{inicio}:E{fin})")
+        escribir_celda_segura(ws, fila_totales, 7, f"=SUM(G{inicio}:G{fin})")
+        escribir_celda_segura(ws, fila_totales, 10, f"=SUM(J{inicio}:J{fin})")
+        escribir_celda_segura(ws, fila_totales, 11, f"=SUM(K{inicio}:K{fin})")
+        escribir_celda_segura(ws, fila_totales, 14, f"=SUM(N{inicio}:N{fin})")
+
+        # Fórmulas de Porcentajes Totales (Protegidas contra división por cero)
+        escribir_celda_segura(ws, fila_totales, 6, f"=IF(B{fila_totales}>0, E{fila_totales}/B{fila_totales}, 0)")
+        escribir_celda_segura(ws, fila_totales, 8, f"=IF(B{fila_totales}>0, G{fila_totales}/B{fila_totales}, 0)")
+        escribir_celda_segura(ws, fila_totales, 12, f"=SUM(L{inicio}:L{fin})")
 
 # ============================================================
 # 4. INTERFAZ STREAMLIT
